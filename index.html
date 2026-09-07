@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>オンライン・マリオ風アクション</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      background: #222;
+      color: #fff;
+      font-family: sans-serif;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+    #game-container {
+      position: relative;
+      width: 100vw;
+      max-width: 800px;
+      height: 60vh;
+      max-height: 400px;
+      background: #5c94fc;
+      overflow: hidden;
+      border: 2px solid #fff;
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    #touch-controls {
+      width: 100vw;
+      max-width: 800px;
+      height: 35vh;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 20px;
+      box-sizing: border-box;
+    }
+    .d-pad, .action-pad {
+      display: flex;
+      gap: 15px;
+    }
+    .btn {
+      width: 65px;
+      height: 65px;
+      background: rgba(255, 255, 255, 0.3);
+      border: 2px solid #fff;
+      border-radius: 50%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-size: 24px;
+      font-weight: bold;
+      color: #fff;
+      touch-action: manipulation;
+    }
+    .btn:active {
+      background: rgba(255, 255, 255, 0.6);
+    }
+    #status {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.6);
+      padding: 6px 12px;
+      border-radius: 5px;
+      font-size: 13px;
+    }
+  </style>
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+</head>
+<body>
+
+  <div id="game-container">
+    <canvas id="canvas" width="800" height="400"></canvas>
+    <div id="status">通信初期化中...</div>
+  </div>
+
+  <div id="touch-controls">
+    <div class="d-pad">
+      <div class="btn" id="btn-left">◀</div>
+      <div class="btn" id="btn-right">▶</div>
+    </div>
+    <div class="action-pad">
+      <div class="btn" id="btn-jump">ジャンプ</div>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+
+    let myId = null;
+    let players = {};
+    const localPlayer = {
+      x: 100 + Math.random() * 100,
+      y: 200,
+      vx: 0,
+      vy: 0,
+      width: 30,
+      height: 40,
+      color: '#ff2222',
+      isGrounded: false
+    };
+
+    const input = { left: false, right: false, jump: false };
+
+    const platforms = [
+      { x: 0, y: 350, w: 2000, h: 50 },
+      { x: 200, y: 250, w: 100, h: 20 },
+      { x: 350, y: 180, w: 80, h: 20 },
+      { x: 500, y: 250, w: 120, h: 20 }
+    ];
+
+    // ----- PeerJS オンライン処理 -----
+    let peer = null;
+    let connections = {};
+
+    function initNetwork() {
+      // ランダムIDで接続
+      peer = new Peer();
+
+      peer.on('open', (id) => {
+        myId = id;
+        statusEl.innerText = "オンライン中 (接続待機中...)";
+        
+        // URLのハッシュ（#部屋名）を利用して同じ部屋同士をつなぐ
+        let room = window.location.hash.replace('#', '');
+        if (!room) {
+          room = 'mario-room-default';
+          window.location.hash = room;
+        }
+
+        // ブロードキャスト用に接続を仲介
+        connectToLobby(room);
+      });
+
+      peer.on('connection', (conn) => {
+        registerConnection(conn);
+      });
+
+      peer.on('error', (err) => {
+        console.error(err);
+        statusEl.innerText = "通信エラーが発生しました";
+      });
+    }
+
+    function connectToLobby(room) {
+      // 共通のロビーID宛てにシグナルを送る処理
+      const lobbyId = 'mario-lobby-' + room;
+      const conn = peer.connect(lobbyId);
+
+      conn.on('open', () => {
+        registerConnection(conn);
+      });
+
+      // 自分が最初の人の場合はロビーの受け皿になる
+      const lobbyPeer = new Peer(lobbyId);
+      lobbyPeer.on('connection', (c) => {
+        registerConnection(c);
+      });
+      lobbyPeer.on('error', () => {
+        // すでにロビーが存在する場合は無視
+      });
+    }
+
+    function registerConnection(conn) {
+      conn.on('open', () => {
+        connections[conn.peer] = conn;
+        updateStatus();
+      });
+
+      conn.on('data', (data) => {
+        if (data.type === 'state') {
+          players[data.id] = data.state;
+        }
+      });
+
+      conn.on('close', () => {
+        delete connections[conn.peer];
+        delete players[conn.peer];
+        updateStatus();
+      });
+    }
+
+    function updateStatus() {
+      const count = Object.keys(connections).length + 1;
+      statusEl.innerText = `オンライン中 (参加者: ${count}人)`;
+    }
+
+    function broadcastState() {
+      const data = {
+        type: 'state',
+        id: myId,
+        state: {
+          x: localPlayer.x,
+          y: localPlayer.y
+        }
+      };
+
+      for (let peerId in connections) {
+        if (connections[peerId].open) {
+          connections[peerId].send(data);
+        }
+      }
+    }
+
+    // ----- 操作処理 -----
+    function setupInputs() {
+      const bindTouch = (id, key) => {
+        const btn = document.getElementById(id);
+        btn.addEventListener('touchstart', (e) => { e.preventDefault(); input[key] = true; }, {passive: false});
+        btn.addEventListener('touchend', (e) => { e.preventDefault(); input[key] = false; }, {passive: false});
+        btn.addEventListener('mousedown', () => { input[key] = true; });
+        btn.addEventListener('mouseup', () => { input[key] = false; });
+      };
+
+      bindTouch('btn-left', 'left');
+      bindTouch('btn-right', 'right');
+      bindTouch('btn-jump', 'jump');
+
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowLeft' || e.key === 'a') input.left = true;
+        if (e.key === 'ArrowRight' || e.key === 'd') input.right = true;
+        if (e.key === 'ArrowUp' || e.key === ' ' || e.key === 'w') input.jump = true;
+      });
+
+      window.addEventListener('keyup', (e) => {
+        if (e.key === 'ArrowLeft' || e.key === 'a') input.left = false;
+        if (e.key === 'ArrowRight' || e.key === 'd') input.right = false;
+        if (e.key === 'ArrowUp' || e.key === ' ' || e.key === 'w') input.jump = false;
+      });
+    }
+
+    // ----- 物理演算 -----
+    function update() {
+      if (input.left) localPlayer.vx = -4;
+      else if (input.right) localPlayer.vx = 4;
+      else localPlayer.vx = 0;
+
+      if (input.jump && localPlayer.isGrounded) {
+        localPlayer.vy = -12;
+        localPlayer.isGrounded = false;
+      }
+
+      localPlayer.vy += 0.6;
+      localPlayer.x += localPlayer.vx;
+      localPlayer.y += localPlayer.vy;
+
+      localPlayer.isGrounded = false;
+      for (let p of platforms) {
+        if (
+          localPlayer.x + localPlayer.width > p.x &&
+          localPlayer.x < p.x + p.w &&
+          localPlayer.y + localPlayer.height >= p.y &&
+          localPlayer.y + localPlayer.height <= p.y + p.h &&
+          localPlayer.vy >= 0
+        ) {
+          localPlayer.y = p.y - localPlayer.height;
+          localPlayer.vy = 0;
+          localPlayer.isGrounded = true;
+        }
+      }
+
+      if (localPlayer.y > 500) {
+        localPlayer.x = 100;
+        localPlayer.y = 100;
+        localPlayer.vy = 0;
+      }
+
+      if (myId) {
+        broadcastState();
+      }
+    }
+
+    // ----- 描画 -----
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const cameraX = localPlayer.x - canvas.width / 2 + localPlayer.width / 2;
+
+      ctx.save();
+      ctx.translate(-cameraX, 0);
+
+      // 床・ブロック
+      ctx.fillStyle = '#8b4513';
+      for (let p of platforms) {
+        ctx.fillRect(p.x, p.y, p.w, p.h);
+      }
+
+      // 他プレイヤー（青色）
+      ctx.fillStyle = '#0055ff';
+      for (let id in players) {
+        const p = players[id];
+        ctx.fillRect(p.x, p.y, 30, 40);
+      }
+
+      // 自分（赤色）
+      ctx.fillStyle = localPlayer.color;
+      ctx.fillRect(localPlayer.x, localPlayer.y, localPlayer.width, localPlayer.height);
+
+      ctx.restore();
+    }
+
+    function loop() {
+      update();
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    setupInputs();
+    initNetwork();
+    loop();
+  </script>
+</body>
+</html>
